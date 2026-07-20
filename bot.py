@@ -1,18 +1,15 @@
 """
-Bourbon Tasters Discord Bot  (SEPARATE bot from the watch bot)
-- Contribution-tier leveling: members earn XP from activity, and crossing a
-  threshold queues them for ONE mod's approval. Three capped, elite tiers:
-  Barrel Proof -> Single Barrel -> Legendary Tater Status. No auto base tier,
-  no auto-demotion (mods demote manually).
-- /bottleprice: auction-price lookup links (Unicorn Auctions / Whisky Hunter).
+Bourbon Tasters Discord Bot
+- Contribution-tier leveling with mod-approved, capped tiers:
+  Barrel Proof -> Single Barrel -> Legendary Tater Status.
+- Mule rewards: in #the-mules, a thank-you that tags someone credits the mule.
+- /bottleprice: auction-price links (Unicorn Auctions / Whisky Hunter).
 
-This is its OWN Discord application with its OWN token. Deploy as a separate
-Railway service from the watch bot.
-Env:  DISCORD_TOKEN (required), GUILD_ID (optional, instant command sync),
-      DB_PATH (optional), RANKUP_CHANNEL (optional, default "rank-up-queue")
+Env: DISCORD_TOKEN (required), GUILD_ID, DB_PATH, RANKUP_CHANNEL.
 """
 
 import os
+import re
 import time
 import sqlite3
 import urllib.parse
@@ -21,42 +18,23 @@ from discord import app_commands
 from discord.ext import commands
 
 # ---------------------------------------------------------------------------
-# Config  —  all values below are tunable
+# Config (all tunable)
 # ---------------------------------------------------------------------------
 TOKEN = os.environ.get("DISCORD_TOKEN")
 GUILD_ID = os.environ.get("GUILD_ID")
 DB_PATH = os.environ.get("DB_PATH", "bourbon_bot.db")
-
-# Mod-only channel where rank-up nominations get posted for approval.
 MOD_QUEUE_CHANNEL = os.environ.get("RANKUP_CHANNEL", "rank-up-queue")
 
-# Tier ladder, entry -> top. All three are earned, capped, mod-approved ranks.
 TIERS = ["Barrel Proof", "Single Barrel", "Legendary Tater Status"]
-
-# XP required before a member is *nominated* for each tier (escalating).
-TIER_THRESHOLDS = {
-    "Barrel Proof": 750,
-    "Single Barrel": 1500,
-    "Legendary Tater Status": 3000,
-}
-
-# Hard caps per tier (None = unlimited). Only the top X hold each role.
-TIER_CAPS = {
-    "Barrel Proof": 40,
-    "Single Barrel": 20,
-    "Legendary Tater Status": 10,
-}
-
-# After a denial, re-nominate only once the member earns this much more XP.
+TIER_THRESHOLDS = {"Barrel Proof": 750, "Single Barrel": 1500, "Legendary Tater Status": 3000}
+TIER_CAPS = {"Barrel Proof": 40, "Single Barrel": 20, "Legendary Tater Status": 10}
 REQUEUE_DELTA = 50
 
-# --- Channel groups (matched by exact name unless noted) -------------------
 REVIEW_CHANNEL = "whisky-reviews"
 DROP_CHANNELS = {"tater-drops", "chi-city-drops", "chi-burbs-drops", "online-drops"}
 PRIORITY_TEXT_CHANNELS = {"general", "bourbon", "whatcha-drinking", "success"}
-BOTTLE_KILL_PREFIX = "bottle-kills-only-"   # number changes per bottle
+BOTTLE_KILL_PREFIX = "bottle-kills-only-"
 
-# --- Point values ----------------------------------------------------------
 BASE_MSG_PTS = 1
 PRIORITY_MSG_PTS = 2
 PHOTO_PTS = 5
@@ -74,13 +52,20 @@ TEXT_COOLDOWN = 60
 PHOTO_COOLDOWN = 30
 REVIEW_COOLDOWN = 600
 
-# In-memory cooldown trackers (reset on restart; that's fine)
 _last_text = {}
 _last_photo = {}
 _last_review = {}
 
-# Unicorn search: confirmed params. "term" is the text query; "state=ENDED"
-# shows sold/past lots (realized prices); omitting state shows live & upcoming.
+# Mule rewards: in #the-mules a thank-you tagging someone credits the mule.
+MULE_CHANNEL = "the-mules"
+MULE_PTS = 50
+MULE_DEDUP_HOURS = 12
+THANKS_TOKENS = {
+    "ty", "tysm", "thx", "thanks", "thank", "thankyou", "thanku",
+    "appreciate", "appreciated", "grateful", "cheers", "salute",
+}
+
+# Unicorn search params (confirmed): "term" is the text query; state=ENDED = sold.
 UNICORN_SEARCH_PARAM = "term"
 
 
@@ -120,6 +105,16 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mule_awards (
+                guild_id   INTEGER NOT NULL,
+                from_user  INTEGER NOT NULL,
+                to_user    INTEGER NOT NULL,
+                ts         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         conn.commit()
 
 
@@ -128,7 +123,7 @@ def init_db():
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.members = True
-intents.message_content = True  # needed to measure post length for XP
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
@@ -149,7 +144,7 @@ async def on_ready():
 
 
 # ===========================================================================
-# Contribution-tier (leveling) system
+# Leveling helpers
 # ===========================================================================
 def get_level_row(gid, uid):
     with db() as conn:
@@ -157,9 +152,7 @@ def get_level_row(gid, uid):
             "SELECT * FROM levels WHERE guild_id=? AND user_id=?", (gid, uid)
         ).fetchone()
         if row is None:
-            conn.execute(
-                "INSERT INTO levels (guild_id, user_id) VALUES (?, ?)", (gid, uid)
-            )
+            conn.execute("INSERT INTO levels (guild_id, user_id) VALUES (?, ?)", (gid, uid))
             conn.commit()
             row = conn.execute(
                 "SELECT * FROM levels WHERE guild_id=? AND user_id=?", (gid, uid)
@@ -183,9 +176,7 @@ def add_xp(gid, uid, amount):
 
 def set_pending(gid, uid, val):
     with db() as conn:
-        conn.execute(
-            "UPDATE levels SET pending=? WHERE guild_id=? AND user_id=?", (val, gid, uid)
-        )
+        conn.execute("UPDATE levels SET pending=? WHERE guild_id=? AND user_id=?", (val, gid, uid))
         conn.commit()
 
 
@@ -201,18 +192,14 @@ def set_denied(gid, uid, xp):
 def set_tier_db(gid, uid, tier):
     get_level_row(gid, uid)
     with db() as conn:
-        conn.execute(
-            "UPDATE levels SET tier=?, pending=0 WHERE guild_id=? AND user_id=?",
-            (tier, gid, uid),
-        )
+        conn.execute("UPDATE levels SET tier=?, pending=0 WHERE guild_id=? AND user_id=?", (tier, gid, uid))
         conn.commit()
 
 
 def queue_add(message_id, gid, uid, tier):
     with db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO rankup_queue "
-            "(message_id, guild_id, user_id, target_tier) VALUES (?,?,?,?)",
+            "INSERT OR REPLACE INTO rankup_queue (message_id, guild_id, user_id, target_tier) VALUES (?,?,?,?)",
             (message_id, gid, uid, tier),
         )
         conn.commit()
@@ -220,9 +207,7 @@ def queue_add(message_id, gid, uid, tier):
 
 def queue_get(message_id):
     with db() as conn:
-        return conn.execute(
-            "SELECT * FROM rankup_queue WHERE message_id=?", (message_id,)
-        ).fetchone()
+        return conn.execute("SELECT * FROM rankup_queue WHERE message_id=?", (message_id,)).fetchone()
 
 
 def queue_del(message_id):
@@ -241,9 +226,7 @@ def next_tier(tier):
 async def ensure_tier_role(guild, tier):
     role = discord.utils.get(guild.roles, name=tier)
     if role is None:
-        role = await guild.create_role(
-            name=tier, mentionable=True, reason="Contribution tier"
-        )
+        role = await guild.create_role(name=tier, mentionable=True, reason="Contribution tier")
     return role
 
 
@@ -262,15 +245,12 @@ def _has_image(message) -> bool:
     for a in message.attachments:
         if (a.content_type or "").startswith("image"):
             return True
-        if a.filename.lower().endswith(
-            (".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic")
-        ):
+        if a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic")):
             return True
     return False
 
 
 async def maybe_nominate(guild, member, xp):
-    """Queue a member for mod approval if they've crossed the next threshold."""
     row = get_level_row(guild.id, member.id)
     if row["pending"]:
         return
@@ -319,11 +299,9 @@ async def award_message_xp(message):
     content = (message.content or "").strip()
     now = time.time()
     pts = 0
-
     if len(content) >= MIN_MSG_LEN and now - _last_text.get(uid, 0) >= TEXT_COOLDOWN:
-        pts += PRIORITY_MSG_PTS if name in PRIORITY_TEXT_CHANNELS else BASE_MSG_PTS
+        pts += BASE_MSG_PTS  # flat 1 in every non-special channel
         _last_text[uid] = now
-
     if (
         name == REVIEW_CHANNEL
         and len(content) >= REVIEW_MIN_LEN
@@ -331,17 +309,62 @@ async def award_message_xp(message):
     ):
         pts += min(REVIEW_MAX_PTS, REVIEW_BASE_PTS + (len(content) // 100) * REVIEW_PER_100)
         _last_review[uid] = now
-
     if _has_image(message) and now - _last_photo.get(uid, 0) >= PHOTO_COOLDOWN:
         if name.startswith(BOTTLE_KILL_PREFIX):
             pts += BOTTLE_KILL_PHOTO_PTS
         else:
             pts += PHOTO_PTS
         _last_photo[uid] = now
-
     if pts > 0:
         new_xp = add_xp(gid, uid, pts)
         await maybe_nominate(message.guild, message.author, new_xp)
+
+
+# ===========================================================================
+# Mule rewards
+# ===========================================================================
+def _is_thanks(content: str) -> bool:
+    low = content.lower()
+    if "thank" in low or "\U0001F64F" in content:
+        return True
+    return any(t in THANKS_TOKENS for t in re.findall(r"[a-z']+", low))
+
+
+def _recent_mule(gid, frm, to) -> bool:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM mule_awards WHERE guild_id=? AND from_user=? AND to_user=? "
+            "AND ts > datetime('now', ?) LIMIT 1",
+            (gid, frm, to, f"-{MULE_DEDUP_HOURS} hours"),
+        ).fetchone()
+        return row is not None
+
+
+def _record_mule(gid, frm, to):
+    with db() as conn:
+        conn.execute("INSERT INTO mule_awards (guild_id, from_user, to_user) VALUES (?,?,?)", (gid, frm, to))
+        conn.commit()
+
+
+async def maybe_award_mule(message):
+    if getattr(message.channel, "name", "") != MULE_CHANNEL:
+        return
+    if not message.mentions or not _is_thanks(message.content or ""):
+        return
+    gid = message.guild.id
+    thanker = message.author.id
+    credited = []
+    for u in message.mentions:
+        if u.bot or u.id == thanker:
+            continue
+        if _recent_mule(gid, thanker, u.id):
+            continue
+        _record_mule(gid, thanker, u.id)
+        new_xp = add_xp(gid, u.id, MULE_PTS)
+        await maybe_nominate(message.guild, u, new_xp)
+        credited.append(u.mention)
+    if credited:
+        await message.channel.send(f"\U0001FACF +{MULE_PTS} XP to {', '.join(credited)} for the mule!")
 
 
 @bot.event
@@ -350,6 +373,7 @@ async def on_message(message):
         return
     try:
         await award_message_xp(message)
+        await maybe_award_mule(message)
     except Exception as e:
         print("XP award error:", repr(e))
 
@@ -374,30 +398,22 @@ class RankupView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(
-        label="Approve", style=discord.ButtonStyle.success, custom_id="rankup_approve"
-    )
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, custom_id="rankup_approve")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
         await handle_rankup(interaction, approve=True)
 
-    @discord.ui.button(
-        label="Deny", style=discord.ButtonStyle.danger, custom_id="rankup_deny"
-    )
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, custom_id="rankup_deny")
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
         await handle_rankup(interaction, approve=False)
 
 
 async def handle_rankup(interaction: discord.Interaction, approve: bool):
     if not interaction.user.guild_permissions.manage_roles:
-        await interaction.response.send_message(
-            "Only moderators (Manage Roles) can decide nominations.", ephemeral=True
-        )
+        await interaction.response.send_message("Only moderators (Manage Roles) can decide nominations.", ephemeral=True)
         return
     rec = queue_get(interaction.message.id)
     if not rec:
-        await interaction.response.send_message(
-            "This nomination is no longer active.", ephemeral=True
-        )
+        await interaction.response.send_message("This nomination is no longer active.", ephemeral=True)
         return
     guild = interaction.guild
     target = rec["target_tier"]
@@ -405,11 +421,8 @@ async def handle_rankup(interaction: discord.Interaction, approve: bool):
     if member is None:
         queue_del(interaction.message.id)
         set_pending(guild.id, rec["user_id"], 0)
-        await interaction.response.edit_message(
-            content="Member is no longer in the server.", embed=None, view=None
-        )
+        await interaction.response.edit_message(content="Member is no longer in the server.", embed=None, view=None)
         return
-
     if approve:
         cap = TIER_CAPS.get(target)
         if cap is not None:
@@ -417,28 +430,22 @@ async def handle_rankup(interaction: discord.Interaction, approve: bool):
             held = len(role.members) if role else 0
             if held >= cap:
                 await interaction.response.send_message(
-                    f"{target} is at its cap ({cap}). Free a slot or raise "
-                    f"TIER_CAPS before approving.",
-                    ephemeral=True,
+                    f"{target} is at its cap ({cap}). Free a slot or raise the cap first.", ephemeral=True
                 )
                 return
         await set_member_tier(guild, member, target)
         queue_del(interaction.message.id)
         await interaction.response.edit_message(
-            content=f"Approved: {member.display_name} promoted to {target} "
-            f"by {interaction.user.display_name}.",
-            embed=None,
-            view=None,
+            content=f"Approved: {member.display_name} promoted to {target} by {interaction.user.display_name}.",
+            embed=None, view=None,
         )
     else:
         row = get_level_row(guild.id, member.id)
         set_denied(guild.id, member.id, row["xp"])
         queue_del(interaction.message.id)
         await interaction.response.edit_message(
-            content=f"Denied: nomination for {member.display_name} -> "
-            f"{target} by {interaction.user.display_name}.",
-            embed=None,
-            view=None,
+            content=f"Denied: nomination for {member.display_name} to {target} by {interaction.user.display_name}.",
+            embed=None, view=None,
         )
 
 
@@ -455,14 +462,10 @@ async def rank(interaction: discord.Interaction, user: discord.Member = None):
         need = TIER_THRESHOLDS[nt]
         prog = f"{xp} / {need} XP toward {nt}"
         if xp >= need:
-            prog += "  — eligible, awaiting mod approval"
+            prog += " - eligible, awaiting mod approval"
     else:
         prog = "Top tier reached."
-    embed = discord.Embed(
-        title=f"{member.display_name} — {tier_display}",
-        description=f"{xp} XP\n{prog}",
-        color=0x6B3F1D,
-    )
+    embed = discord.Embed(title=f"{member.display_name} - {tier_display}", description=f"{xp} XP\n{prog}", color=0x6B3F1D)
     if member.display_avatar:
         embed.set_thumbnail(url=member.display_avatar.url)
     await interaction.response.send_message(embed=embed)
@@ -472,8 +475,7 @@ async def rank(interaction: discord.Interaction, user: discord.Member = None):
 async def leaderboard(interaction: discord.Interaction):
     with db() as conn:
         rows = conn.execute(
-            "SELECT user_id, xp, tier FROM levels WHERE guild_id=? "
-            "ORDER BY xp DESC LIMIT 10",
+            "SELECT user_id, xp, tier FROM levels WHERE guild_id=? ORDER BY xp DESC LIMIT 30",
             (interaction.guild_id,),
         ).fetchall()
     if not rows:
@@ -483,12 +485,8 @@ async def leaderboard(interaction: discord.Interaction):
     for i, r in enumerate(rows, 1):
         m = interaction.guild.get_member(r["user_id"])
         nm = m.display_name if m else f"User {r['user_id']}"
-        lines.append(f"{i}. {nm} — {r['xp']} XP ({r['tier'] or 'Unranked'})")
-    embed = discord.Embed(
-        title="Contribution Leaderboard",
-        description="\n".join(lines),
-        color=0x6B3F1D,
-    )
+        lines.append(f"{i}. {nm} - {r['xp']} XP ({r['tier'] or 'Unranked'})")
+    embed = discord.Embed(title="Contribution Leaderboard", description="\n".join(lines), color=0x6B3F1D)
     await interaction.response.send_message(embed=embed)
 
 
@@ -498,10 +496,7 @@ async def leaderboard(interaction: discord.Interaction):
 async def addevent(interaction: discord.Interaction, user: discord.Member, points: int = EVENT_PTS):
     new_xp = add_xp(interaction.guild_id, user.id, points)
     await maybe_nominate(interaction.guild, user, new_xp)
-    await interaction.response.send_message(
-        f"Gave {user.display_name} {points} XP for an event. Now at {new_xp} XP.",
-        ephemeral=True,
-    )
+    await interaction.response.send_message(f"Gave {user.display_name} {points} XP. Now at {new_xp} XP.", ephemeral=True)
 
 
 @bot.tree.command(description="(Mod) Adjust a member's XP (negative to subtract).")
@@ -510,18 +505,11 @@ async def addevent(interaction: discord.Interaction, user: discord.Member, point
 async def addxp(interaction: discord.Interaction, user: discord.Member, amount: int):
     new_xp = add_xp(interaction.guild_id, user.id, amount)
     await maybe_nominate(interaction.guild, user, new_xp)
-    await interaction.response.send_message(
-        f"Adjusted {user.display_name} by {amount}. Now at {new_xp} XP.",
-        ephemeral=True,
-    )
+    await interaction.response.send_message(f"Adjusted {user.display_name} by {amount}. Now at {new_xp} XP.", ephemeral=True)
 
 
 async def tier_autocomplete(interaction: discord.Interaction, current: str):
-    return [
-        app_commands.Choice(name=t, value=t)
-        for t in TIERS
-        if current.lower() in t.lower()
-    ][:25]
+    return [app_commands.Choice(name=t, value=t) for t in TIERS if current.lower() in t.lower()][:25]
 
 
 @bot.tree.command(description="(Mod) Set a member's tier directly.")
@@ -530,14 +518,10 @@ async def tier_autocomplete(interaction: discord.Interaction, current: str):
 @app_commands.checks.has_permissions(manage_roles=True)
 async def setrank(interaction: discord.Interaction, user: discord.Member, tier: str):
     if tier not in TIERS:
-        await interaction.response.send_message(
-            f"Unknown tier. Options: {', '.join(TIERS)}", ephemeral=True
-        )
+        await interaction.response.send_message(f"Unknown tier. Options: {', '.join(TIERS)}", ephemeral=True)
         return
     await set_member_tier(interaction.guild, user, tier)
-    await interaction.response.send_message(
-        f"Set {user.display_name} to {tier}.", ephemeral=True
-    )
+    await interaction.response.send_message(f"Set {user.display_name} to {tier}.", ephemeral=True)
 
 
 async def remove_all_tier_roles(guild, member):
@@ -562,24 +546,16 @@ async def demote(interaction: discord.Interaction, user: discord.Member):
     guild = interaction.guild
     cur = current_tier_of(guild, user)
     if cur is None:
-        await interaction.response.send_message(
-            f"{user.display_name} holds no tier role.", ephemeral=True
-        )
+        await interaction.response.send_message(f"{user.display_name} holds no tier role.", ephemeral=True)
         return
     i = TIERS.index(cur)
     if i == 0:
         await remove_all_tier_roles(guild, user)
-        await interaction.response.send_message(
-            f"Removed {cur} from {user.display_name} — now unranked.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"Removed {cur} from {user.display_name} - now unranked.", ephemeral=True)
     else:
         new = TIERS[i - 1]
         await set_member_tier(guild, user, new)
-        await interaction.response.send_message(
-            f"Demoted {user.display_name} from {cur} to {new}.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"Demoted {user.display_name} from {cur} to {new}.", ephemeral=True)
 
 
 @bot.tree.command(description="(Mod) Flag a member for demotion review.")
@@ -588,21 +564,13 @@ async def demote(interaction: discord.Interaction, user: discord.Member):
 async def flag(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason given"):
     guild = interaction.guild
     cur = current_tier_of(guild, user) or "Unranked"
-    embed = discord.Embed(
-        title="Flagged for demotion review",
-        description=(
-            f"{user.mention} ({cur})\nReason: {reason}\n\n"
-            f"A mod can run /demote to remove a tier, or leave them be."
-        ),
-        color=0xB00020,
-    )
+    desc = f"{user.mention} ({cur})\nReason: {reason}\n\nA mod can run /demote to remove a tier, or leave them be."
+    embed = discord.Embed(title="Flagged for demotion review", description=desc, color=0xB00020)
     embed.set_footer(text=f"Flagged by {interaction.user.display_name}")
     channel = discord.utils.get(guild.text_channels, name=MOD_QUEUE_CHANNEL)
     if channel is not None:
         await channel.send(embed=embed)
-        await interaction.response.send_message(
-            f"Flagged {user.display_name} in #{MOD_QUEUE_CHANNEL}.", ephemeral=True
-        )
+        await interaction.response.send_message(f"Flagged {user.display_name} in #{MOD_QUEUE_CHANNEL}.", ephemeral=True)
     else:
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -611,46 +579,25 @@ async def flag(interaction: discord.Interaction, user: discord.Member, reason: s
 # Bottle price lookup
 # ===========================================================================
 def bottle_links_view(name: str) -> discord.ui.View:
-    """Buttons linking straight to each site's native search (no Google bounce)."""
     q = urllib.parse.quote_plus(name)
     base = f"https://www.unicornauctions.com/search?{UNICORN_SEARCH_PARAM}={q}"
     view = discord.ui.View()
-    view.add_item(discord.ui.Button(
-        label="Unicorn — Sold", emoji="\U0001F984", style=discord.ButtonStyle.link,
-        url=f"{base}&state=ENDED&sortBy=number_asc",
-    ))
-    view.add_item(discord.ui.Button(
-        label="Unicorn — Live", emoji="\U0001F984", style=discord.ButtonStyle.link,
-        url=base,
-    ))
-    view.add_item(discord.ui.Button(
-        label="Sold Prices (Whisky Hunter)", emoji="\U0001F4B0",
-        style=discord.ButtonStyle.link,
-        url=f"https://whiskyhunter.net/search?q={q}",
-    ))
+    view.add_item(discord.ui.Button(label="Unicorn - Sold", emoji="\U0001F984", style=discord.ButtonStyle.link, url=f"{base}&state=ENDED&sortBy=number_asc"))
+    view.add_item(discord.ui.Button(label="Unicorn - Live", emoji="\U0001F984", style=discord.ButtonStyle.link, url=base))
     return view
 
 
-@bot.tree.command(
-    description="Look up auction prices for a bottle (bourbon, scotch, rye, etc.)."
-)
+@bot.tree.command(description="Look up auction prices for a bottle (bourbon, scotch, rye, etc.).")
 @app_commands.describe(bottle="Bottle name, e.g. Pappy Van Winkle 15 or Lagavulin 16")
 async def bottleprice(interaction: discord.Interaction, bottle: str):
     desc = (
-        "Tap below for this bottle on Unicorn Auctions (current + past lots) and its "
-        "realized auction prices on Whisky Hunter.\n\n"
-        "Auction results are hammer prices; Unicorn adds a 15% buyer's premium plus "
-        "tax and shipping on top."
+        "Tap below for this bottle on Unicorn Auctions (sold + live lots) and realized "
+        "prices on Whisky Hunter.\n\nAuction results are hammer prices; Unicorn adds a "
+        "15% buyer's premium plus tax and shipping."
     )
-    embed = discord.Embed(
-        title=f"Auction prices: {bottle}",
-        description=desc,
-        color=0x6B3F1D,
-    )
+    embed = discord.Embed(title=f"Auction prices: {bottle}", description=desc, color=0x6B3F1D)
     embed.set_footer(text="Bourbon Tasters - bottle price links")
-    await interaction.response.send_message(
-        embed=embed, view=bottle_links_view(bottle)
-    )
+    await interaction.response.send_message(embed=embed, view=bottle_links_view(bottle))
 
 
 if __name__ == "__main__":
